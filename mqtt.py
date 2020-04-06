@@ -12,6 +12,7 @@ import sched
 import json
 import binascii
 import types
+import subprocess
 from threading import Thread
 from test import TestDevice
 
@@ -27,6 +28,16 @@ logging.config.fileConfig(dirname + 'logging.conf')
 CONFIG = os.getenv('BROADLINKMQTTCONFIG', dirname + 'mqtt.conf')
 CONFIG_CUSTOM = os.getenv('BROADLINKMQTTCONFIGCUSTOM', dirname + 'custom.conf')
 
+def pingOk(sHost, count=1, wait_sec=1):
+    try:
+        cmd = "ping -{} {} -W {} {}".format('n' if sys.platform.lower() in ["win32","win64"] else 'c', count, wait_sec, sHost)
+        output = subprocess.check_output(cmd, shell=True)
+
+    except Exception as e:
+        logging.error("Host %s is not reachable. (%s)" % (sHost,e))
+        return False
+
+    return True
 
 class Config(object):
     def __init__(self, filename=CONFIG, custom_filename=CONFIG_CUSTOM):
@@ -74,6 +85,8 @@ qos = cf.get('mqtt_qos', 0)
 retain = cf.get('mqtt_retain', False)
 
 topic_prefix = cf.get('mqtt_topic_prefix', 'broadlink/')
+devices_dict = {}
+device_rescan_required = False
 
 
 # noinspection PyUnusedLocal
@@ -208,6 +221,14 @@ def on_message(client, device, msg):
                 macro(device, file)
                 return
 
+        if device.type == "SmartBulb":
+            if command == "set":
+                status = device.set_json(action)
+                topic = msg.topic.replace("/set", "/state")
+                logging.debug("Updating status on MQTT topic: %s, (command: %s)" % (topic, command))
+                mqttc.publish(topic, status, qos=qos, retain=retain)
+            return
+
         logging.warning("Unrecognized MQTT message " + action)
     except Exception:
         logging.exception("Error")
@@ -222,7 +243,7 @@ def on_connect(client, device, flags, result_code):
 
 # noinspection PyUnusedLocal
 def on_disconnect(client, device, rc):
-    logging.warn("OOOOPS! MQTT disconnection")
+    logging.warning("OOOOPS! MQTT disconnection")
     time.sleep(10)
 
 
@@ -259,7 +280,7 @@ def record(device, file):
             f.write(binascii.hexlify(ir_packet))
         logging.debug("Done")
     else:
-        logging.warn("No command received")
+        logging.warning("No command received")
 
 
 def record_rf(device, file):
@@ -274,7 +295,7 @@ def record_rf(device, file):
         timeout -= 1
 
     if timeout <= 0:
-        logging.warn("RF Frequency not found")
+        logging.warning("RF Frequency not found")
         device.cancel_sweep_frequency()
         return
 
@@ -299,7 +320,7 @@ def record_rf(device, file):
             f.write(binascii.hexlify(rf_packet))
         logging.debug("Done")
     else:
-        logging.warn("No command received")
+        logging.warning("No command received")
 
 
 def replay(device, file):
@@ -325,7 +346,7 @@ def macro(device, file):
                 replay(device, command_file)
 
 
-def get_device(cf):
+def get_device(cf, devices_dictionary={}):
     device_type = cf.get('device_type', 'lookup')
     if device_type == 'lookup':
         local_address = cf.get('local_address', None)
@@ -362,6 +383,31 @@ def get_device(cf):
         return devices_dict
     elif device_type == 'test':
         return configure_device(TestDevice(cf), topic_prefix)
+    elif device_type == 'dict':
+        global device_rescan_required
+        device_rescan_required = False
+        devices_list = json.loads(cf.get('devices_dict', '[]'))
+        mqtt_multiple_prefix_format = cf.get('mqtt_multiple_subprefix_format', None)
+        for device in devices_list:
+            if pingOk(sHost = device['host'], count=3):
+                mac = bytearray.fromhex(device['mac'].replace(':', ' '))[::-1]
+                host = (device['host'], 80)
+                init_func = getattr(broadlink,device['class'])
+                deviceObj = init_func(host=host, mac=mac, devtype=int(device['devtype'],0))
+                mqtt_subprefix = mqtt_multiple_prefix_format.format(
+                    type=deviceObj.type,
+                    host=deviceObj.host[0],
+                    mac='_'.join(format(s, '02x') for s in deviceObj.mac[::-1]),
+                    mac_nic='_'.join(format(s, '02x') for s in deviceObj.mac[2::-1]))
+                if mqtt_subprefix not in devices_dictionary:
+                    device_configured = configure_device(deviceObj, topic_prefix + mqtt_subprefix)
+                    devices_dictionary[mqtt_subprefix] = device_configured
+                    print("Type: %s, host: %s, MQTT subprefix: %s" % (deviceObj.type, deviceObj.host, mqtt_subprefix))
+        if len(devices_list) != len(devices_dictionary):
+            device_rescan_required = True
+            logging.warning('Less devices are found than expected. Rescan is required.')
+        return devices_dictionary
+
     else:
         host = (cf.get('device_host'), 80)
         mac = bytearray.fromhex(cf.get('device_mac').replace(':', ' '))
@@ -381,6 +427,8 @@ def get_device(cf):
             device = broadlink.dooya(host=host, mac=mac, devtype=0x4E4D)
         elif device_type == 'bg1':
             device = broadlink.bg1(host=host, mac=mac, devtype=0x51E3)
+        elif device_type == 'SmartBulb':
+            device = broadlink.lb1(host=host, mac=mac, devtype=0x60c8)
         else:
             logging.error('Incorrect device configured: ' + device_type)
             sys.exit(2)
@@ -460,6 +508,16 @@ def configure_device(device, mqtt_prefix):
         scheduler = sched.scheduler(time.time, time.sleep)
         scheduler.enter(broadlink_bg1_state_interval, 1, broadlink_bg1_state_timer,
                         [scheduler, broadlink_bg1_state_interval, device, mqtt_prefix])
+        # scheduler.run()
+        tt = SchedulerThread(scheduler)
+        tt.daemon = True
+        tt.start()
+
+    broadlink_lb1_state_interval = cf.get('broadlink_lb1_state_interval', 0)
+    if device.type == 'SmartBulb' and broadlink_lb1_state_interval > 0:
+        scheduler = sched.scheduler(time.time, time.sleep)
+        scheduler.enter(broadlink_lb1_state_interval, 1, broadlink_lb1_state_timer,
+                        [scheduler, broadlink_lb1_state_interval, device, mqtt_prefix])
         # scheduler.run()
         tt = SchedulerThread(scheduler)
         tt.daemon = True
@@ -560,6 +618,37 @@ def broadlink_bg1_state_timer(scheduler, delay, device, mqtt_prefix):
     except:
         logging.exception("Error")
 
+def broadlink_lb1_state_timer(scheduler, delay, device, mqtt_prefix):
+    scheduler.enter(delay, 1, broadlink_lb1_state_timer, [scheduler, delay, device, mqtt_prefix])
+
+    try:
+        is_json = cf.get('broadlink_lb1_state_json', False)
+        pingOk(device.host[0])
+        state = device.get_state()
+        if is_json:
+            topic = mqtt_prefix + "state"
+            value = json.dumps(state)
+            logging.debug("Sending LB1 state '%s' to topic '%s'" % (value, topic))
+            mqttc.publish(topic, value, qos=qos, retain=retain)
+        elif state is not None:
+            for name in state:
+                topic = mqtt_prefix + "state/" + name
+                value = str(state[name])
+                logging.debug("Sending LB1 %s '%s' to topic '%s'" % (name, value, topic))
+                mqttc.publish(topic, value, qos=qos, retain=retain)
+    except:
+        logging.exception("Error")
+
+def device_rescan_timer(scheduler, delay, devices, cf):
+    global mqttc
+    logging.debug("Executing re-scan thread")
+    if (device_rescan_required):
+        devices = get_device(cf, devices_dictionary=devices)
+        mqttc.user_data_set(devices)
+    else:
+        logging.debug("Re-scan was not necessary")
+    scheduler.enter(delay, 1, device_rescan_timer, [scheduler, delay, devices, cf])
+
 
 class SchedulerThread(Thread):
     def __init__(self, scheduler):
@@ -575,6 +664,17 @@ class SchedulerThread(Thread):
 
 if __name__ == '__main__':
     devices = get_device(cf)
+    device_rescan_timer_delay = cf.get('device_rescan_timer_delay', 0)
+    if cf.get('device_type','lookup') == 'dict' and device_rescan_timer_delay > 0:
+        logging.debug("Scheduling re-scan thread")
+        scheduler = sched.scheduler(time.time, time.sleep)
+        scheduler.enter(device_rescan_timer_delay, 1, device_rescan_timer,
+                        [scheduler, device_rescan_timer_delay, devices, cf])
+        # scheduler.run()
+        rs = SchedulerThread(scheduler)
+        rs.daemon = True
+        rs.start()
+
 
     clientid = cf.get('mqtt_clientid', 'broadlink-%s' % os.getpid())
     # initialise MQTT broker connection
@@ -603,7 +703,7 @@ if __name__ == '__main__':
             mqttc.connect(cf.get('mqtt_broker', 'localhost'), int(cf.get('mqtt_port', '1883')), 60)
             mqttc.loop_forever()
         except socket.error:
-            logging.warn("Cannot connect to MQTT server, will try to reconnect in 5 seconds")
+            logging.warning("Cannot connect to MQTT server, will try to reconnect in 5 seconds")
             time.sleep(5)
         except KeyboardInterrupt:
             sys.exit(0)

@@ -1,2 +1,2 @@
 paho-mqtt
-broadlink
+-e git+git://github.com/csabavirag/python-broadlink.git@lb1#egg=broadlink
